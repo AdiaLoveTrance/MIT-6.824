@@ -19,8 +19,10 @@ package raft
 
 import (
 	//	"bytes"
+	"math/rand"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	//	"6.824/labgob"
 	"6.824/labrpc"
@@ -69,6 +71,13 @@ type Raft struct {
 	current_term int    // latest term server has seen (initialized to 0 on first boot, increases monotonically)
 	voted_for    int    // candidateId that received vote in current term (or null if none)
 	log          []byte // log entries; each entry contains command for state machine, and term when entry was received by leader (first index is 1)
+
+	commit_index int // index of highest log entry known to be committed (initialized to 0, increases monotonically)
+	last_applied int // index of highest log entry applied to state machine (initialized to 0, increases monotonically)
+
+	// Reinitialized after election
+	next_index  []int // for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
+	match_index []int // for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
 
 	role Role
 }
@@ -137,6 +146,29 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
+type AppendEntriesArgs struct {
+	LeaderTerm        int
+	LeaderId          int
+	PrevLogIndex      int
+	PrevLogTerm       int
+	LogEntries        []byte
+	LeaderCommitIndex int // leader’s commitIndex
+}
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+}
+
+// AppendEntries RPC
+func (rf *Raft) AppendEntries(arg *AppendEntriesArgs, reply *AppendEntriesReply) {
+	if arg.LeaderTerm < rf.current_term {
+		reply.Term = rf.current_term
+		reply.Success = false
+		return
+	}
+
+}
+
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 type RequestVoteArgs struct {
@@ -158,6 +190,33 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+
+	// TODO: add lock
+	if args.CandidateTerm < rf.current_term {
+		reply.TermReply = rf.current_term
+		reply.VoteGranted = false
+		return
+	}
+	// If the logs have last entries with different terms, then the log with the later term is more up-to-date. If the logs end with the same term, then whichever log is longer is more up-to-date.
+	if rf.voted_for == -1 {
+		if args.LastLogTerm < rf.current_term {
+			reply.TermReply = rf.current_term
+			reply.VoteGranted = false
+			return
+		}
+		if args.LastLogTerm == rf.current_term && args.LastLogIndex < rf.commit_index {
+			reply.TermReply = rf.current_term
+			reply.VoteGranted = false
+			return
+		}
+		// vote for it
+		reply.VoteGranted = true
+		rf.voted_for = args.CandidateId
+	}
+
+	// already voted
+	reply.TermReply = rf.current_term
+	reply.VoteGranted = false
 
 }
 
@@ -242,6 +301,7 @@ func (rf *Raft) ticker() {
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
+		time.Sleep(time.Duration(rand.Intn(150)+150) * time.Millisecond)
 		for i := 0; i < len(rf.peers); i++ {
 			if i == rf.me {
 				continue
@@ -269,6 +329,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	rf.current_term = 0 // 应该从文件中读取
+	rf.voted_for = -1
+	rf.commit_index = 0
+	rf.last_applied = 0
 
 	// Your initialization code here (2A, 2B, 2C).
 
