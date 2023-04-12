@@ -168,10 +168,15 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(arg *AppendEntriesArgs, reply *AppendEntriesReply) {
 	fmt.Println("append entries from ", arg.LeaderId)
 	rf.mu.Lock()
+	// if rf.role != Follower {
+	// 	reply.Term = rf.current_term
+	// 	reply.Success = false
+	// 	rf.mu.Unlock()
+	// 	return
+	// }
 	if arg.LeaderTerm < rf.current_term {
 		reply.Term = rf.current_term
 		reply.Success = false
-		rf.voted_for = -1
 		rf.mu.Unlock()
 		return
 	}
@@ -220,6 +225,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = false
 		return
 	}
+	if args.CandidateTerm > rf.current_term {
+		rf.role = Follower
+		rf.current_term = args.CandidateTerm
+		reply.VoteGranted = true
+		reply.TermReply = rf.current_term
+		rf.voted_for = args.CandidateId
+		return
+	}
 	// If the logs have last entries with different terms, then the log with the later term is more up-to-date. If the logs end with the same term, then whichever log is longer is more up-to-date.
 	if rf.voted_for == -1 || args.CandidateId == rf.voted_for {
 		// if args.LastLogTerm < rf.current_term {
@@ -234,6 +247,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		// }
 		// vote for it
 		reply.VoteGranted = true
+		reply.TermReply = rf.current_term
 		rf.voted_for = args.CandidateId
 		return
 	}
@@ -327,12 +341,12 @@ func (rf *Raft) ticker() {
 		switch rf.role {
 		case Follower:
 			// timeout then become Candidate, or reset sleep
-			sleep_time := rand.Intn(150) + 150
+			sleep_time := rand.Intn(200) + 200
 			select {
 			case h := <-rf.hb_chan:
 				fmt.Println("heartbeat from ", h)
 			case <-time.After(time.Duration(sleep_time) * time.Millisecond):
-				fmt.Println("have not heard from leader after ", sleep_time, "ms...")
+				fmt.Println(rf.me, " have not heard from leader after ", sleep_time, "ms...")
 				rf.mu.Lock()
 				rf.role = Candidate
 				rf.mu.Unlock()
@@ -341,6 +355,8 @@ func (rf *Raft) ticker() {
 
 		case Candidate:
 			// Candidate then request vote
+			// 选举过程有时间限制
+			sleep_time := rand.Intn(150) + 150
 			rf.mu.Lock()
 			rf.current_term += 1
 			rf.voted_for = rf.me
@@ -349,14 +365,14 @@ func (rf *Raft) ticker() {
 			cond := sync.NewCond(&mu)
 			count := 0
 			finished := 0
+			time_out := false
 			half := len(rf.peers) / 2
 			for i := 0; i < len(rf.peers); i++ {
 				if i == rf.me {
 					continue
 				} else {
 					go func(x int) {
-						mu.Lock()
-						defer mu.Unlock()
+						fmt.Println(rf.me, "send request vote to ", x)
 						// send request vote rpc
 						var args RequestVoteArgs
 						var reply RequestVoteReply
@@ -367,29 +383,45 @@ func (rf *Raft) ticker() {
 						// args.LastLogIndex
 						// args.LastLogTerm
 						ok := rf.sendRequestVote(x, &args, &reply)
+						mu.Lock()
+						defer mu.Unlock()
 						if ok && reply.VoteGranted {
 							fmt.Println("VoteGranted")
 							count++
 						}
 						finished++
 						cond.Broadcast()
+						fmt.Println(rf.me, "send request vote to ", x, "done")
 					}(i)
 				}
 			}
+			// go func(sleep_time int) {
+			// 	time.Sleep(time.Duration(sleep_time) * time.Millisecond)
+			// 	mu.Lock()
+			// 	time_out = true
+			// 	cond.Broadcast()
+			// }(sleep_time)
 			mu.Lock()
-			for count < half && finished < len(rf.peers)-1 {
+			for count < half && finished < len(rf.peers)-1 && !time_out {
 				cond.Wait()
 			}
+			// if time_out {
+			// 	fmt.Println(rf.me, " elaction timeout, re-elaction")
+			// 	continue
+			// }
 			if count >= half {
-				fmt.Println("received ", count, " vote, more than half")
+				fmt.Println(rf.me, " received ", count, " vote, more than half")
 				rf.mu.Lock()
 				rf.role = Leader
 				rf.mu.Unlock()
 			} else {
-				fmt.Println("reveived ", count, " vote, less than half, become follower")
-				rf.mu.Lock()
-				rf.role = Follower
-				rf.mu.Unlock()
+				fmt.Println(rf.me, " reveived ", count, " vote, less than half, become follower")
+				time.Sleep(time.Duration(sleep_time) * time.Millisecond)
+				continue
+				// rf.mu.Lock()
+				// rf.role = Follower
+				// rf.voted_for = -1
+				// rf.mu.Unlock()
 			}
 			mu.Unlock()
 		case Leader:
@@ -408,13 +440,14 @@ func (rf *Raft) ticker() {
 					rf.mu.Lock()
 					args.LeaderTerm = rf.current_term
 					rf.mu.Unlock()
-					fmt.Println("append entries to ", x)
 					ok := rf.sendAppendEntries(x, &args, &reply)
 					if ok {
 						fmt.Println("send heartbeat to ", x, ", reply success: ", reply.Success, ", its term: ", reply.Term)
 						rf.mu.Lock()
 						if reply.Term > rf.current_term {
 							rf.role = Follower
+							rf.current_term = reply.Term
+							rf.voted_for = -1
 						}
 						rf.mu.Unlock()
 					} else {
