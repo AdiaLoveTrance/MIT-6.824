@@ -523,14 +523,11 @@ func (rf *Raft) ticker() {
 		case Leader:
 			rf.mu.Unlock()
 			// Leader then send heartbeats
-			w := sync.WaitGroup{}
 			for i := 0; i < len(rf.peers); i++ {
 				if i == rf.me {
 					continue
 				}
-				w.Add(1)
 				go func(x int) {
-					defer w.Done()
 					var args AppendEntriesArgs
 					var reply AppendEntriesReply
 					args.LeaderId = rf.me
@@ -553,7 +550,6 @@ func (rf *Raft) ticker() {
 					}
 				}(i)
 			}
-			w.Wait()
 			time.Sleep(time.Duration(100) * time.Millisecond)
 		}
 
