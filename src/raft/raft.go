@@ -67,6 +67,11 @@ const (
 	Follower  Role = 2
 )
 
+type Entry struct {
+	term    int
+	command interface{}
+}
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -78,9 +83,9 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	current_term int    // latest term server has seen (initialized to 0 on first boot, increases monotonically)
-	voted_for    int    // candidateId that received vote in current term (or null if none)
-	log          []byte // log entries; each entry contains command for state machine, and term when entry was received by leader (first index is 1)
+	current_term int     // latest term server has seen (initialized to 0 on first boot, increases monotonically)
+	voted_for    int     // candidateId that received vote in current term (or null if none)
+	log          []Entry // log entries; each entry contains command for state machine, and term when entry was received by leader (first index is 1)
 
 	commit_index int // index of highest log entry known to be committed (initialized to 0, increases monotonically)
 	last_applied int // index of highest log entry applied to state machine (initialized to 0, increases monotonically)
@@ -90,8 +95,6 @@ type Raft struct {
 	match_index []int // for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
 
 	role Role
-
-	hb_chan chan int
 
 	electionTimer  *time.Timer
 	heartbeatTimer *time.Timer
@@ -168,7 +171,7 @@ type AppendEntriesArgs struct {
 	LeaderId          int
 	PrevLogIndex      int
 	PrevLogTerm       int
-	LogEntries        []byte
+	LogEntries        []Entry
 	LeaderCommitIndex int // leader’s commitIndex
 }
 type AppendEntriesReply struct {
@@ -196,7 +199,6 @@ func (rf *Raft) AppendEntries(arg *AppendEntriesArgs, reply *AppendEntriesReply)
 	rf.role = Follower
 	rf.voted_for = -1
 	rf.mu.Unlock()
-	// rf.hb_chan <- arg.LeaderId
 	rf.electionTimer.Reset(RandomizedElectionTimeout())
 }
 
@@ -327,6 +329,17 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
+	term, isLeader = rf.GetState()
+	if !isLeader {
+		return index, term, isLeader
+	}
+	rf.mu.Lock()
+	e := Entry{term, command}
+	rf.log = append(rf.log, e)
+	index = rf.commit_index
+	// append entries
+
+	rf.mu.Unlock()
 
 	return index, term, isLeader
 }
@@ -352,6 +365,8 @@ func (rf *Raft) killed() bool {
 
 func (rf *Raft) StartElection() {
 	// Candidate then request vote
+	// 选举过程有时间限制
+	sleep_time := rand.Intn(150) + 150
 	rf.mu.Lock()
 	rf.current_term += 1
 	rf.voted_for = rf.me
@@ -367,7 +382,7 @@ func (rf *Raft) StartElection() {
 			continue
 		} else {
 			go func(x int) {
-				fmt.Println(rf.me, "send request vote to ", x)
+
 				// send request vote rpc
 				var args RequestVoteArgs
 				var reply RequestVoteReply
@@ -378,6 +393,7 @@ func (rf *Raft) StartElection() {
 				// args.LastLogIndex
 				// args.LastLogTerm
 				ok := rf.sendRequestVote(x, &args, &reply)
+				fmt.Println(rf.me, "send request vote to ", x)
 				mu.Lock()
 				defer mu.Unlock()
 				if ok && reply.VoteGranted {
@@ -388,13 +404,20 @@ func (rf *Raft) StartElection() {
 			}(i)
 		}
 	}
-
+	go func(sleep_time int) {
+		time.Sleep(time.Duration(sleep_time) * time.Millisecond)
+		mu.Lock()
+		defer mu.Unlock()
+		time_out = true
+		cond.Broadcast()
+	}(sleep_time)
 	mu.Lock()
 	for count < half && finished < len(rf.peers)-1 && !time_out {
 		cond.Wait()
 	}
 	if time_out {
-		fmt.Println(rf.me, " elaction timeout, re-elaction")
+		fmt.Println(rf.me, " election timeout, re-elaction")
+		// continue
 	}
 	if count >= half {
 		fmt.Println(rf.me, " received ", count, " vote, more than half")
@@ -403,6 +426,7 @@ func (rf *Raft) StartElection() {
 		rf.mu.Unlock()
 	} else {
 		fmt.Println(rf.me, " reveived ", count, " vote, less than half")
+		time.Sleep(time.Duration(sleep_time) * time.Millisecond)
 	}
 	mu.Unlock()
 
@@ -429,18 +453,7 @@ func (rf *Raft) ticker() {
 		switch rf.role {
 		case Follower:
 			rf.mu.Unlock()
-			// timeout then become Candidate, or reset sleep
-			// sleep_time := rand.Intn(200) + 200
-			// select {
-			// case h := <-rf.hb_chan:
-			// 	fmt.Println("heartbeat from ", h)
-			// case <-time.After(time.Duration(sleep_time) * time.Millisecond):
-			// 	fmt.Println(rf.me, " have not heard from leader after ", sleep_time, "ms...")
-			// 	rf.mu.Lock()
-			// 	rf.role = Candidate
-			// 	rf.mu.Unlock()
-			// 	fmt.Println(rf.me, " become Candidate")
-			// }
+
 			select {
 			case <-rf.electionTimer.C:
 				fmt.Println(rf.me, " have not heard from leader")
@@ -448,8 +461,7 @@ func (rf *Raft) ticker() {
 				rf.role = Candidate
 				rf.mu.Unlock()
 				fmt.Println(rf.me, " become Candidate")
-			default:
-				// fmt.Println("heartbeat...")
+
 			}
 
 		case Candidate:
@@ -513,6 +525,13 @@ func (rf *Raft) ticker() {
 				fmt.Println(rf.me, " received ", count, " vote, more than half")
 				rf.mu.Lock()
 				rf.role = Leader
+				// init nextIndex and matchIndex
+				rf.next_index = []int{}
+				rf.match_index = []int{}
+				for i := 0; i < len(rf.peers); i++ {
+					rf.next_index = append(rf.next_index, 0)
+					rf.match_index = append(rf.match_index, 0)
+				}
 				rf.mu.Unlock()
 			} else {
 				fmt.Println(rf.me, " reveived ", count, " vote, less than half")
@@ -533,6 +552,10 @@ func (rf *Raft) ticker() {
 					args.LeaderId = rf.me
 					rf.mu.Lock()
 					args.LeaderTerm = rf.current_term
+					// init other field according to rf.next_index and rf.match_index
+					next_index := rf.next_index[i]
+					match_index := rf.match_index[i]
+
 					rf.mu.Unlock()
 					ok := rf.sendAppendEntries(x, &args, &reply)
 					if ok {
@@ -578,9 +601,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.commit_index = 0
 	rf.last_applied = 0
 	rf.role = Follower
-	rf.hb_chan = make(chan int)
 	rf.electionTimer = time.NewTimer(RandomizedElectionTimeout())
 	rf.heartbeatTimer = time.NewTimer(StableHeartbeatTimeout())
+	rf.log = []Entry{}
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
