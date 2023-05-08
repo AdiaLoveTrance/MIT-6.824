@@ -193,6 +193,19 @@ func (rf *Raft) AppendEntries(arg *AppendEntriesArgs, reply *AppendEntriesReply)
 
 	// arg.LeaderTerm >= rf.current_term goes here
 	// add more condition
+	// TODO: 检查越界
+	if rf.commit_index < arg.PrevLogIndex || rf.log[arg.PrevLogIndex].term != arg.PrevLogTerm {
+		reply.Term = rf.current_term
+		reply.Success = false
+		rf.mu.Unlock()
+		return
+	}
+
+	// from here rf.log[arg.PrevLogIndex].term == arg.PrevLogTerm, start copy log
+	for index, value := range arg.LogEntries {
+		rf.log[arg.PrevLogIndex+index] = value
+	}
+
 	reply.Success = true
 	reply.Term = rf.current_term
 	rf.current_term = arg.LeaderTerm
@@ -529,7 +542,7 @@ func (rf *Raft) ticker() {
 				rf.next_index = []int{}
 				rf.match_index = []int{}
 				for i := 0; i < len(rf.peers); i++ {
-					rf.next_index = append(rf.next_index, 0)
+					rf.next_index = append(rf.next_index, rf.commit_index+1)
 					rf.match_index = append(rf.match_index, 0)
 				}
 				rf.mu.Unlock()
@@ -553,8 +566,18 @@ func (rf *Raft) ticker() {
 					rf.mu.Lock()
 					args.LeaderTerm = rf.current_term
 					// init other field according to rf.next_index and rf.match_index
-					next_index := rf.next_index[i]
-					match_index := rf.match_index[i]
+					args.PrevLogIndex = rf.next_index[x] - 2
+					if args.PrevLogIndex > 0 {
+						args.PrevLogTerm = rf.log[args.PrevLogIndex].term
+
+					}
+					args.LeaderCommitIndex = rf.commit_index
+					log_entries_num := args.LeaderCommitIndex - args.PrevLogIndex + 1
+					args.LogEntries = make([]Entry, log_entries_num)
+					copied := copy(args.LogEntries, rf.log[args.PrevLogIndex:args.LeaderCommitIndex+1])
+					if log_entries_num != copied {
+						panic("log_entries_num not equal to copied")
+					}
 
 					rf.mu.Unlock()
 					ok := rf.sendAppendEntries(x, &args, &reply)
