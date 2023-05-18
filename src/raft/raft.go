@@ -406,6 +406,193 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+func (rf *Raft) StartElection() {
+	// 选举过程有时间限制
+	sleep_time := rand.Intn(150) + 150
+	rf.mu.Lock()
+	rf.current_term += 1
+	rf.voted_for = rf.me
+	rf.mu.Unlock()
+	var mu sync.Mutex
+	cond := sync.NewCond(&mu)
+	count := 0
+	finished := 0
+	time_out := false
+	half := len(rf.peers) / 2
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		} else {
+			go func(x int) {
+
+				// send request vote rpc
+				var args RequestVoteArgs
+				var reply RequestVoteReply
+				rf.mu.Lock()
+				args.CandidateId = rf.me
+				args.CandidateTerm = rf.current_term
+				rf.mu.Unlock()
+				// args.LastLogIndex
+				// args.LastLogTerm
+				ok := rf.sendRequestVote(x, &args, &reply)
+				// fmt.Println(rf.me, "send request vote to ", x)
+				mu.Lock()
+				defer mu.Unlock()
+				if ok && reply.VoteGranted {
+					count++
+				}
+				finished++
+				cond.Broadcast()
+			}(i)
+		}
+	}
+	go func(sleep_time int) {
+		time.Sleep(time.Duration(sleep_time) * time.Millisecond)
+		mu.Lock()
+		defer mu.Unlock()
+		time_out = true
+		cond.Broadcast()
+	}(sleep_time)
+	mu.Lock()
+	for count < half && finished < len(rf.peers)-1 && !time_out {
+		cond.Wait()
+	}
+	if time_out {
+		// fmt.Println(rf.me, " election timeout, re-elaction")
+		return
+	}
+	if count >= half {
+		fmt.Println(rf.me, " received ", count, " vote, more than half")
+		rf.mu.Lock()
+		rf.role = Leader
+		// init nextIndex and matchIndex
+		rf.next_index = make([]int, len(rf.peers))
+		rf.match_index = make([]int, len(rf.peers))
+		for i := 0; i < len(rf.peers); i++ {
+			rf.next_index[i] = rf.commit_index + 1
+			rf.match_index[i] = 0
+		}
+		rf.mu.Unlock()
+	} else {
+		fmt.Println(rf.me, " reveived ", count, " vote, less than half")
+		time.Sleep(time.Duration(sleep_time) * time.Millisecond)
+	}
+	mu.Unlock()
+}
+
+func (rf *Raft) RequestVoteTo(x int, count int, finished int, mu *sync.Mutex, cond *sync.Cond) {
+	// send request vote rpc
+	var args RequestVoteArgs
+	var reply RequestVoteReply
+	rf.mu.Lock()
+	args.CandidateId = rf.me
+	args.CandidateTerm = rf.current_term
+	rf.mu.Unlock()
+	// args.LastLogIndex
+	// args.LastLogTerm
+	ok := rf.sendRequestVote(x, &args, &reply)
+	// fmt.Println(rf.me, "send request vote to ", x)
+	mu.Lock()
+	defer mu.Unlock()
+	if ok && reply.VoteGranted {
+		count++
+	}
+	finished++
+	cond.Broadcast()
+}
+
+func (rf *Raft) StartAppendEntriesOrHeastBeats() {
+	// 可以在外面copy rf的成员，不用每次都重新copy
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+		go func(x int) {
+			var args AppendEntriesArgs
+			var reply AppendEntriesReply
+			args.LeaderId = rf.me
+			rf.mu.Lock()
+			args.LeaderTerm = rf.current_term
+			var log_entries_num int = 0
+			len_log := len(rf.log)
+			send_log_entries := false
+
+			// 什么时候该发log entries
+			if rf.next_index[x] <= len_log-1 {
+				// init other field according to rf.next_index and rf.match_index
+				args.PrevLogIndex = rf.next_index[x] - 1
+				args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
+
+				args.LeaderCommitIndex = rf.commit_index
+
+				log_entries_num = len_log - rf.next_index[x]
+				args.LogEntries = make([]Entry, log_entries_num)
+				copied := copy(args.LogEntries, rf.log[rf.next_index[x]:])
+				if log_entries_num != copied {
+					fmt.Println("log_entries_num not equal to copied: ", log_entries_num, ":", copied)
+					panic("error")
+				}
+				send_log_entries = true
+			}
+
+			rf.mu.Unlock()
+			ok := rf.sendAppendEntries(x, &args, &reply)
+			if ok {
+				fmt.Println("send heartbeat to ", x, ", reply success: ", reply.Success, ", its term: ", reply.Term)
+				rf.mu.Lock()
+				if reply.Term > rf.current_term {
+					rf.role = Follower
+					rf.current_term = reply.Term
+					rf.voted_for = -1
+				}
+				// update next_index
+				if reply.Success {
+					if send_log_entries {
+						rf.match_index[x] += log_entries_num
+						rf.next_index[x] += log_entries_num
+						fmt.Println(x, ": match_index ", rf.match_index[x], ", next_index ", rf.next_index[x])
+
+					}
+				} else {
+					rf.next_index[x] -= 1
+				}
+				rf.mu.Unlock()
+			} else {
+				// try more times
+				// fmt.Println("send heartbeat not ok")
+			}
+		}(i)
+	}
+	// TODO: 这部分可以优化
+	// 找rf.match_index里面第half大的数
+	go func() {
+		rf.mu.Lock()
+		var v = make([]int, 0)
+		for i, x := range rf.match_index {
+			if i == rf.me {
+				continue
+			}
+			v = append(v, x)
+		}
+		sort.Ints(v)
+		rf.mu.Unlock()
+		half := len(rf.peers) / 2
+		update_index := v[half]
+		for i := rf.last_reply_index + 1; i <= update_index; i++ {
+			msg := ApplyMsg{}
+			msg.Command = rf.log[i].Command
+			msg.CommandIndex = i
+			msg.CommandValid = true
+			rf.applyCh <- msg
+			fmt.Println("apply command", msg.Command, " index ", msg.CommandIndex)
+		}
+		rf.commit_index = update_index
+		rf.last_reply_index = update_index
+		fmt.Println(rf.me, " commit index ", rf.commit_index)
+
+	}()
+}
+
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
 func (rf *Raft) ticker() {
@@ -432,171 +619,12 @@ func (rf *Raft) ticker() {
 		case Candidate:
 			rf.mu.Unlock()
 			// Candidate then request vote
-			// 选举过程有时间限制
-			sleep_time := rand.Intn(150) + 150
-			rf.mu.Lock()
-			rf.current_term += 1
-			rf.voted_for = rf.me
-			rf.mu.Unlock()
-			var mu sync.Mutex
-			cond := sync.NewCond(&mu)
-			count := 0
-			finished := 0
-			time_out := false
-			half := len(rf.peers) / 2
-			for i := 0; i < len(rf.peers); i++ {
-				if i == rf.me {
-					continue
-				} else {
-					go func(x int) {
-
-						// send request vote rpc
-						var args RequestVoteArgs
-						var reply RequestVoteReply
-						rf.mu.Lock()
-						args.CandidateId = rf.me
-						args.CandidateTerm = rf.current_term
-						rf.mu.Unlock()
-						// args.LastLogIndex
-						// args.LastLogTerm
-						ok := rf.sendRequestVote(x, &args, &reply)
-						// fmt.Println(rf.me, "send request vote to ", x)
-						mu.Lock()
-						defer mu.Unlock()
-						if ok && reply.VoteGranted {
-							count++
-						}
-						finished++
-						cond.Broadcast()
-					}(i)
-				}
-			}
-			go func(sleep_time int) {
-				time.Sleep(time.Duration(sleep_time) * time.Millisecond)
-				mu.Lock()
-				defer mu.Unlock()
-				time_out = true
-				cond.Broadcast()
-			}(sleep_time)
-			mu.Lock()
-			for count < half && finished < len(rf.peers)-1 && !time_out {
-				cond.Wait()
-			}
-			if time_out {
-				// fmt.Println(rf.me, " election timeout, re-elaction")
-				continue
-			}
-			if count >= half {
-				fmt.Println(rf.me, " received ", count, " vote, more than half")
-				rf.mu.Lock()
-				rf.role = Leader
-				// init nextIndex and matchIndex
-				rf.next_index = make([]int, len(rf.peers))
-				rf.match_index = make([]int, len(rf.peers))
-				for i := 0; i < len(rf.peers); i++ {
-					rf.next_index[i] = rf.commit_index + 1
-					rf.match_index[i] = 0
-				}
-				rf.mu.Unlock()
-			} else {
-				fmt.Println(rf.me, " reveived ", count, " vote, less than half")
-				time.Sleep(time.Duration(sleep_time) * time.Millisecond)
-			}
-			mu.Unlock()
+			rf.StartElection()
 
 		case Leader:
 			rf.mu.Unlock()
 			// Leader then send heartbeats
-			// 可以在外面copy rf的成员，不用每次都重新copy
-			for i := 0; i < len(rf.peers); i++ {
-				if i == rf.me {
-					continue
-				}
-				go func(x int) {
-					var args AppendEntriesArgs
-					var reply AppendEntriesReply
-					args.LeaderId = rf.me
-					rf.mu.Lock()
-					args.LeaderTerm = rf.current_term
-					var log_entries_num int = 0
-					len_log := len(rf.log)
-					send_log_entries := false
-
-					// 什么时候该发log entries
-					if rf.next_index[x] <= len_log-1 {
-						// init other field according to rf.next_index and rf.match_index
-						args.PrevLogIndex = rf.next_index[x] - 1
-						args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
-
-						args.LeaderCommitIndex = rf.commit_index
-
-						log_entries_num = len_log - rf.next_index[x]
-						args.LogEntries = make([]Entry, log_entries_num)
-						copied := copy(args.LogEntries, rf.log[rf.next_index[x]:])
-						if log_entries_num != copied {
-							fmt.Println("log_entries_num not equal to copied: ", log_entries_num, ":", copied)
-							panic("error")
-						}
-						send_log_entries = true
-					}
-
-					rf.mu.Unlock()
-					ok := rf.sendAppendEntries(x, &args, &reply)
-					if ok {
-						fmt.Println("send heartbeat to ", x, ", reply success: ", reply.Success, ", its term: ", reply.Term)
-						rf.mu.Lock()
-						if reply.Term > rf.current_term {
-							rf.role = Follower
-							rf.current_term = reply.Term
-							rf.voted_for = -1
-						}
-						// update next_index
-						if reply.Success {
-							if send_log_entries {
-								rf.match_index[x] += log_entries_num
-								rf.next_index[x] += log_entries_num
-								fmt.Println(x, ": match_index ", rf.match_index[x], ", next_index ", rf.next_index[x])
-
-							}
-						} else {
-							rf.next_index[x] -= 1
-						}
-						rf.mu.Unlock()
-					} else {
-						// try more times
-						// fmt.Println("send heartbeat not ok")
-					}
-				}(i)
-			}
-			// TODO: 这部分可以优化
-			// 找rf.match_index里面第half大的数
-			go func() {
-				rf.mu.Lock()
-				var v = make([]int, 0)
-				for i, x := range rf.match_index {
-					if i == rf.me {
-						continue
-					}
-					v = append(v, x)
-				}
-				sort.Ints(v)
-				rf.mu.Unlock()
-				half := len(rf.peers) / 2
-				update_index := v[half]
-				for i := rf.last_reply_index + 1; i <= update_index; i++ {
-					msg := ApplyMsg{}
-					msg.Command = rf.log[i].Command
-					msg.CommandIndex = i
-					msg.CommandValid = true
-					rf.applyCh <- msg
-					fmt.Println("apply command", msg.Command, " index ", msg.CommandIndex)
-				}
-				rf.commit_index = update_index
-				rf.last_reply_index = update_index
-				fmt.Println(rf.me, " commit index ", rf.commit_index)
-
-			}()
-
+			rf.StartAppendEntriesOrHeastBeats()
 			time.Sleep(time.Duration(100) * time.Millisecond)
 		}
 
