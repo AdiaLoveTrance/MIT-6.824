@@ -220,6 +220,10 @@ func (rf *Raft) AppendEntries(arg *AppendEntriesArgs, reply *AppendEntriesReply)
 		var pre_logs []Entry = rf.log[:arg.PrevLogIndex+1]
 		rf.log = append(pre_logs, arg.LogEntries...)
 		fmt.Println(rf.me, " new log is ", rf.log)
+		for i := 0; i < len(arg.LogEntries); i++ {
+			msg := ApplyMsg{CommandValid: true, CommandIndex: arg.LogEntries[i].Index, Command: arg.LogEntries[i].Command}
+			rf.applyCh <- msg
+		}
 		rf.commit_index = len(rf.log) - 1
 		if arg.LeaderCommitIndex > rf.commit_index {
 			if arg.LeaderCommitIndex > len(rf.log)-1 {
