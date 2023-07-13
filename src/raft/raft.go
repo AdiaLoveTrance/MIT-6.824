@@ -220,12 +220,7 @@ func (rf *Raft) AppendEntries(arg *AppendEntriesArgs, reply *AppendEntriesReply)
 		// from here rf.log[arg.PrevLogIndex].term == arg.PrevLogTerm, start copy log
 		var pre_logs []Entry = rf.log[:arg.PrevLogIndex+1]
 		rf.log = append(pre_logs, arg.LogEntries...)
-		// fmt.Println(rf.me, " new log is ", rf.log)
-		for i := 0; i < len(arg.LogEntries); i++ {
-			msg := ApplyMsg{CommandValid: true, CommandIndex: arg.LogEntries[i].Index, Command: arg.LogEntries[i].Command}
-			rf.applyCh <- msg
-		}
-		rf.commit_index = len(rf.log) - 1
+
 		if arg.LeaderCommitIndex > rf.commit_index {
 			if arg.LeaderCommitIndex > len(rf.log)-1 {
 				rf.commit_index = len(rf.log) - 1
@@ -233,7 +228,44 @@ func (rf *Raft) AppendEntries(arg *AppendEntriesArgs, reply *AppendEntriesReply)
 				rf.commit_index = arg.LeaderCommitIndex
 			}
 		}
+
+		for rf.last_applied < rf.commit_index {
+			rf.last_applied++
+			msg := ApplyMsg{CommandValid: true, CommandIndex: rf.log[rf.last_applied].Index, Command: rf.log[rf.last_applied].Command}
+			rf.applyCh <- msg
+			fmt.Println(rf.me, " apply ", msg)
+		}
 		fmt.Println(rf.me, " commit index ", rf.commit_index)
+	} else {
+		if arg.PrevLogIndex >= len(rf.log) {
+			reply.Term = rf.current_term
+			reply.Success = false
+			rf.mu.Unlock()
+			return
+		}
+		// log有那一项，但是不匹配
+		if rf.log[arg.PrevLogIndex].Term != arg.PrevLogTerm {
+			reply.Term = rf.current_term
+			reply.Success = false
+			rf.mu.Unlock()
+			return
+		}
+		// 这里有bug，新的leader
+		if arg.LeaderCommitIndex > rf.commit_index {
+			if arg.LeaderCommitIndex > len(rf.log)-1 {
+				rf.commit_index = len(rf.log) - 1
+			} else {
+				rf.commit_index = arg.LeaderCommitIndex
+			}
+		}
+
+		for rf.last_applied < rf.commit_index {
+			rf.last_applied++
+			msg := ApplyMsg{CommandValid: true, CommandIndex: rf.log[rf.last_applied].Index, Command: rf.log[rf.last_applied].Command}
+			rf.applyCh <- msg
+			fmt.Println(rf.me, " apply ", msg)
+		}
+		// fmt.Println(rf.me, " commit index ", rf.commit_index)
 	}
 
 	// fmt.Println(rf.me, " commit index ", rf.commit_index)
@@ -307,7 +339,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			reply.VoteGranted = true
 			reply.TermReply = rf.current_term
 			rf.voted_for = args.CandidateId
-			// fmt.Println(rf.me, " vote2 for ", args.CandidateId)
+			// fmt.Println(rf.me, " vote for ", args.CandidateId)
 			rf.mu.Unlock()
 			rf.electionTimer.Reset(RandomizedElectionTimeout())
 			return
@@ -499,7 +531,7 @@ func (rf *Raft) StartElection() {
 		cond.Wait()
 	}
 	if time_out {
-		// fmt.Println(rf.me, " election timeout, re-elaction")
+		fmt.Println(rf.me, " election timeout, re-elaction")
 		return
 	}
 	if count >= half {
@@ -542,6 +574,37 @@ func (rf *Raft) RequestVoteTo(x int, count int, finished int, mu *sync.Mutex, co
 	cond.Broadcast()
 }
 
+func (rf *Raft) StartApplyLogs() {
+	// shoud hold lock
+	rf.mu.Lock()
+	var v = make([]int, 0)
+	for i, x := range rf.match_index {
+		if i == rf.me {
+			continue
+		}
+		v = append(v, x)
+	}
+	sort.Ints(v)
+	half := len(rf.peers) / 2
+	update_index := v[half]
+	if update_index > rf.commit_index && rf.log[update_index].Term == rf.current_term {
+		fmt.Println("update_index", update_index)
+		rf.commit_index = update_index
+	}
+	rf.mu.Unlock()
+	for rf.last_applied < rf.commit_index {
+		rf.last_applied++
+		msg := ApplyMsg{}
+		msg.CommandValid = true
+		msg.CommandIndex = rf.log[rf.last_applied].Index
+		msg.Command = rf.log[rf.last_applied].Command
+		rf.applyCh <- msg
+		fmt.Println("apply command", msg.Command, " index ", msg.CommandIndex)
+	}
+
+	fmt.Println(rf.me, " commit index ", rf.commit_index, ", last applied ", rf.last_applied)
+}
+
 func (rf *Raft) StartAppendEntriesOrHeastBeats() {
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
@@ -553,6 +616,15 @@ func (rf *Raft) StartAppendEntriesOrHeastBeats() {
 			args.LeaderId = rf.me
 			rf.mu.Lock()
 			args.LeaderTerm = rf.current_term
+			args.LeaderCommitIndex = rf.commit_index
+			if rf.next_index[x]-1 < 0 {
+				args.PrevLogIndex = 0
+			} else {
+				args.PrevLogIndex = rf.next_index[x] - 1
+			}
+
+			args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
+
 			var log_entries_num int = 0
 			len_log := len(rf.log)
 			send_log_entries := false
@@ -560,15 +632,6 @@ func (rf *Raft) StartAppendEntriesOrHeastBeats() {
 			// 什么时候该发log entries
 			if rf.next_index[x] <= len_log-1 {
 				// init other field according to rf.next_index and rf.match_index
-				if rf.next_index[x]-1 < 0 {
-					args.PrevLogIndex = 0
-				} else {
-					args.PrevLogIndex = rf.next_index[x] - 1
-				}
-
-				args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
-
-				args.LeaderCommitIndex = rf.commit_index
 
 				log_entries_num = len_log - rf.next_index[x]
 				args.LogEntries = make([]Entry, log_entries_num)
@@ -578,12 +641,13 @@ func (rf *Raft) StartAppendEntriesOrHeastBeats() {
 					panic("error")
 				}
 				send_log_entries = true
+				fmt.Println("send logs to ", x, " , logs ", args.LogEntries)
 			}
 
 			rf.mu.Unlock()
 			ok := rf.sendAppendEntries(x, &args, &reply)
 			if ok {
-				fmt.Println("send heartbeat to ", x, ", reply success: ", reply.Success, ", its term: ", reply.Term)
+				fmt.Println(rf.me, " send heartbeat to ", x, ", reply success: ", reply.Success, ", its term: ", reply.Term)
 				rf.mu.Lock()
 				if reply.Term > rf.current_term {
 					// here reply false
@@ -591,6 +655,7 @@ func (rf *Raft) StartAppendEntriesOrHeastBeats() {
 					rf.current_term = reply.Term
 					rf.voted_for = -1
 					rf.mu.Unlock()
+					fmt.Println(rf.me, " become follower...")
 					return
 				}
 				// update next_index
@@ -599,8 +664,8 @@ func (rf *Raft) StartAppendEntriesOrHeastBeats() {
 						rf.match_index[x] = len_log - 1
 						rf.next_index[x] = rf.match_index[x] + 1
 						fmt.Println(x, ": match_index ", rf.match_index[x], ", next_index ", rf.next_index[x])
-
 					}
+
 				} else {
 					if send_log_entries {
 						// 这里不能一直减，会小于零
@@ -617,40 +682,8 @@ func (rf *Raft) StartAppendEntriesOrHeastBeats() {
 			}
 		}(i)
 	}
-	// TODO: 这部分可以优化
-	// 找rf.match_index里面第half大的数
-	go func() {
-		rf.mu.Lock()
-		// if rf.role != Leader {
-		// 	rf.mu.Unlock()
-		// 	return
-		// }
 
-		var v = make([]int, 0)
-		for i, x := range rf.match_index {
-			if i == rf.me {
-				continue
-			}
-			v = append(v, x)
-		}
-		sort.Ints(v)
-		rf.mu.Unlock()
-		half := len(rf.peers) / 2
-		update_index := v[half]
-		for i := rf.last_reply_index + 1; i <= update_index; i++ {
-			msg := ApplyMsg{}
-			msg.Command = rf.log[i].Command
-			msg.CommandIndex = i
-			msg.CommandValid = true
-			rf.applyCh <- msg
-			fmt.Println("apply command", msg.Command, " index ", msg.CommandIndex)
-			rf.commit_index = i
-			rf.last_reply_index = i
-		}
-
-		fmt.Println(rf.me, " commit index ", rf.commit_index)
-
-	}()
+	go rf.StartApplyLogs()
 }
 
 // The ticker go routine starts a new election if this peer hasn't received
