@@ -198,9 +198,6 @@ func (rf *Raft) AppendEntries(arg *AppendEntriesArgs, reply *AppendEntriesReply)
 	}
 
 	// arg.LeaderTerm >= rf.current_term goes here
-	// add more condition
-	// TODO: 检查越界
-	// empty LogEntries for heartbeat
 	if len(arg.LogEntries) > 0 {
 		// log没有那一项
 		if arg.PrevLogIndex >= len(rf.log) {
@@ -301,69 +298,36 @@ type RequestVoteReply struct {
 }
 
 // example RequestVote RPC handler.
+// TODO: 这里有问题
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 
 	rf.mu.Lock()
 
 	reply.VoteGranted = false
-
+	DPrintf("Server %d: got RequestVote from candidate %d, args: %+v, current currentTerm: %d, current log: %v\n", rf.me, args.CandidateId, args, rf.current_term, rf.log)
 	if args.CandidateTerm < rf.current_term {
+		// fmt.Println(rf.me, " not1 vote to ", args.CandidateId, ",", args)
 		reply.TermReply = rf.current_term
 		reply.VoteGranted = false
 		rf.mu.Unlock()
 		return
-	}
-	// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
-	// 好像没说reply什么
-	if args.CandidateTerm > rf.current_term {
+	} else if args.CandidateTerm > rf.current_term {
+		// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
+		// convert to follower
 		rf.role = Follower
 		rf.current_term = args.CandidateTerm
 		rf.voted_for = -1
-		if rf.voted_for == -1 || args.CandidateId == rf.voted_for {
-			log_last_term_of_me := rf.log[len(rf.log)-1].Term
-			if args.LastLogTerm < log_last_term_of_me {
-				reply.TermReply = rf.current_term
-				reply.VoteGranted = false
-				rf.mu.Unlock()
-				return
-			}
-			if args.LastLogTerm == log_last_term_of_me && args.LastLogIndex < rf.log[len(rf.log)-1].Index {
-				reply.TermReply = rf.current_term
-				reply.VoteGranted = false
-				rf.mu.Unlock()
-				return
-			}
-
-			// vote for it
-			reply.VoteGranted = true
-			reply.TermReply = rf.current_term
-			rf.voted_for = args.CandidateId
-			// fmt.Println(rf.me, " vote for ", args.CandidateId)
-			rf.mu.Unlock()
-			rf.electionTimer.Reset(RandomizedElectionTimeout())
-			return
-		}
-		reply.VoteGranted = true
-		reply.TermReply = rf.current_term
-		rf.voted_for = args.CandidateId
-		// fmt.Println(rf.me, " vote1 for ", args.CandidateId)
-		rf.mu.Unlock()
-		rf.electionTimer.Reset(RandomizedElectionTimeout())
-
-		return
-	}
-	// If the logs have last entries with different terms, then the log with the later term is more up-to-date.
-	// If the logs end with the same term, then whichever log is longer is more up-to-date.
-	if rf.voted_for == -1 || args.CandidateId == rf.voted_for {
 		log_last_term_of_me := rf.log[len(rf.log)-1].Term
 		if args.LastLogTerm < log_last_term_of_me {
+			// fmt.Println(rf.me, " not2 vote to ", args.CandidateId, rf.voted_for, args, rf.log)
 			reply.TermReply = rf.current_term
 			reply.VoteGranted = false
 			rf.mu.Unlock()
 			return
 		}
 		if args.LastLogTerm == log_last_term_of_me && args.LastLogIndex < rf.log[len(rf.log)-1].Index {
+			// fmt.Println(rf.me, " not3 vote to ", args.CandidateId, rf.log[len(rf.log)-1].Index, args, rf.log)
 			reply.TermReply = rf.current_term
 			reply.VoteGranted = false
 			rf.mu.Unlock()
@@ -374,16 +338,47 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = true
 		reply.TermReply = rf.current_term
 		rf.voted_for = args.CandidateId
-		// fmt.Println(rf.me, " vote2 for ", args.CandidateId)
+		// fmt.Println(rf.me, " vote for ", args.CandidateId)
 		rf.mu.Unlock()
 		rf.electionTimer.Reset(RandomizedElectionTimeout())
 		return
+
+	} else {
+		// args.CandidateTerm == rf.current_term
+		if rf.voted_for == -1 || args.CandidateId == rf.voted_for {
+			log_last_term_of_me := rf.log[len(rf.log)-1].Term
+			if args.LastLogTerm < log_last_term_of_me {
+				fmt.Println(rf.me, " not4 vote to ", args.CandidateId, ",", args)
+				reply.TermReply = rf.current_term
+				reply.VoteGranted = false
+				rf.mu.Unlock()
+				return
+			}
+			if args.LastLogTerm == log_last_term_of_me && args.LastLogIndex < rf.log[len(rf.log)-1].Index {
+				fmt.Println(rf.me, " not5 vote to ", args.CandidateId, ",", args)
+				reply.TermReply = rf.current_term
+				reply.VoteGranted = false
+				rf.mu.Unlock()
+				return
+			}
+
+			// vote for it
+			reply.VoteGranted = true
+			reply.TermReply = rf.current_term
+			rf.voted_for = args.CandidateId
+			// fmt.Println(rf.me, " vote2 for ", args.CandidateId)
+			rf.mu.Unlock()
+			rf.electionTimer.Reset(RandomizedElectionTimeout())
+			return
+		} else {
+			fmt.Println(rf.me, " not6 vote to ", args.CandidateId, ",", args)
+			// already voted
+			reply.TermReply = rf.current_term
+			reply.VoteGranted = false
+			rf.mu.Unlock()
+		}
 	}
 
-	// already voted
-	reply.TermReply = rf.current_term
-	reply.VoteGranted = false
-	rf.mu.Unlock()
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -475,8 +470,17 @@ func (rf *Raft) StartElection() {
 	// 选举过程有时间限制
 	sleep_time := rand.Intn(150) + 150
 	rf.mu.Lock()
+	if rf.role != Candidate {
+		rf.mu.Unlock()
+		return
+	}
 	rf.current_term += 1
 	rf.voted_for = rf.me
+	var args RequestVoteArgs
+	args.CandidateId = rf.me
+	args.CandidateTerm = rf.current_term
+	args.LastLogIndex = rf.log[len(rf.log)-1].Index
+	args.LastLogTerm = rf.log[len(rf.log)-1].Term
 	rf.mu.Unlock()
 	var mu sync.Mutex
 	cond := sync.NewCond(&mu)
@@ -491,17 +495,9 @@ func (rf *Raft) StartElection() {
 			go func(x int) {
 
 				// send request vote rpc
-				var args RequestVoteArgs
 				var reply RequestVoteReply
-				rf.mu.Lock()
-				args.CandidateId = rf.me
-				args.CandidateTerm = rf.current_term
-				args.LastLogIndex = rf.log[len(rf.log)-1].Index
-				args.LastLogTerm = rf.log[len(rf.log)-1].Term
-				rf.mu.Unlock()
 
 				ok := rf.sendRequestVote(x, &args, &reply)
-				// fmt.Println(rf.me, "send request vote to ", x)
 				mu.Lock()
 				defer mu.Unlock()
 				if ok {
@@ -511,11 +507,13 @@ func (rf *Raft) StartElection() {
 						rf.mu.Lock()
 						rf.current_term = reply.TermReply
 						rf.role = Follower
+						rf.voted_for = -1
 						rf.mu.Unlock()
 					}
 				}
 				finished++
 				cond.Broadcast()
+				fmt.Println(rf.me, "send request vote to ", x, " , reply ", reply.VoteGranted)
 			}(i)
 		}
 	}
@@ -532,6 +530,7 @@ func (rf *Raft) StartElection() {
 	}
 	if time_out {
 		fmt.Println(rf.me, " election timeout, re-elaction")
+		time.Sleep(time.Duration(sleep_time) * time.Millisecond)
 		return
 	}
 	if count >= half {
@@ -606,6 +605,14 @@ func (rf *Raft) StartApplyLogs() {
 }
 
 func (rf *Raft) StartAppendEntriesOrHeastBeats() {
+	// 这里rf.state == leader的判断很有必要, 见FailAgree2B
+	// 如果某个刚恢复的Follower在心跳到达前开始选举, Leader状态会变为Follower, 更新Term并重新选举
+	rf.mu.Lock()
+	if rf.role != Leader {
+		rf.mu.Unlock()
+		return
+	}
+	rf.mu.Unlock()
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
 			continue
@@ -641,7 +648,7 @@ func (rf *Raft) StartAppendEntriesOrHeastBeats() {
 					panic("error")
 				}
 				send_log_entries = true
-				fmt.Println("send logs to ", x, " , logs ", args.LogEntries)
+				// fmt.Println("send logs to ", x, " , logs ", args.LogEntries)
 			}
 
 			rf.mu.Unlock()
@@ -670,6 +677,9 @@ func (rf *Raft) StartAppendEntriesOrHeastBeats() {
 					if send_log_entries {
 						// 这里不能一直减，会小于零
 						rf.next_index[x] -= 1
+						if rf.next_index[x] < 1 {
+							rf.next_index[x] = 1
+						}
 						fmt.Println(x, " next index decri ", rf.next_index[x])
 
 					}
@@ -678,7 +688,7 @@ func (rf *Raft) StartAppendEntriesOrHeastBeats() {
 				rf.mu.Unlock()
 			} else {
 				// try more times
-				fmt.Println("send heartbeat not ok")
+				// fmt.Println("send heartbeat not ok")
 			}
 		}(i)
 	}
