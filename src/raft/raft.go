@@ -187,8 +187,9 @@ type AppendEntriesReply struct {
 // AppendEntries RPC
 func (rf *Raft) AppendEntries(arg *AppendEntriesArgs, reply *AppendEntriesReply) {
 	// fmt.Println("append entries from ", arg.LeaderId)
-	rf.mu.Lock()
 	rf.electionTimer.Reset(RandomizedElectionTimeout())
+
+	rf.mu.Lock()
 
 	if arg.LeaderTerm < rf.current_term {
 		reply.Term = rf.current_term
@@ -265,12 +266,10 @@ func (rf *Raft) AppendEntries(arg *AppendEntriesArgs, reply *AppendEntriesReply)
 		// fmt.Println(rf.me, " commit index ", rf.commit_index)
 	}
 
-	// fmt.Println(rf.me, " commit index ", rf.commit_index)
+	rf.convertToFollower(arg.LeaderTerm, -1)
+
 	reply.Success = true
 	reply.Term = rf.current_term
-	rf.current_term = arg.LeaderTerm
-	rf.role = Follower
-	rf.voted_for = -1
 	rf.mu.Unlock()
 }
 
@@ -305,9 +304,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 
 	reply.VoteGranted = false
-	DPrintf("Server %d: got RequestVote from candidate %d, args: %+v, current currentTerm: %d, current log: %v\n", rf.me, args.CandidateId, args, rf.current_term, rf.log)
+	DPrintf("Server %d Role %v: got RequestVote from candidate %d, args: %+v, current currentTerm: %d, current log: %v\n", rf.me, rf.role, args.CandidateId, args, rf.current_term, rf.log)
 	if args.CandidateTerm < rf.current_term {
-		// fmt.Println(rf.me, " not1 vote to ", args.CandidateId, ",", args)
 		reply.TermReply = rf.current_term
 		reply.VoteGranted = false
 		rf.mu.Unlock()
@@ -315,19 +313,16 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	} else if args.CandidateTerm > rf.current_term {
 		// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
 		// convert to follower
-		rf.role = Follower
-		rf.current_term = args.CandidateTerm
-		rf.voted_for = -1
+		rf.convertToFollower(args.CandidateTerm, -1)
+		rf.electionTimer.Reset(RandomizedElectionTimeout())
 		log_last_term_of_me := rf.log[len(rf.log)-1].Term
 		if args.LastLogTerm < log_last_term_of_me {
-			// fmt.Println(rf.me, " not2 vote to ", args.CandidateId, rf.voted_for, args, rf.log)
 			reply.TermReply = rf.current_term
 			reply.VoteGranted = false
 			rf.mu.Unlock()
 			return
 		}
 		if args.LastLogTerm == log_last_term_of_me && args.LastLogIndex < rf.log[len(rf.log)-1].Index {
-			// fmt.Println(rf.me, " not3 vote to ", args.CandidateId, rf.log[len(rf.log)-1].Index, args, rf.log)
 			reply.TermReply = rf.current_term
 			reply.VoteGranted = false
 			rf.mu.Unlock()
@@ -338,9 +333,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = true
 		reply.TermReply = rf.current_term
 		rf.voted_for = args.CandidateId
-		// fmt.Println(rf.me, " vote for ", args.CandidateId)
 		rf.mu.Unlock()
-		rf.electionTimer.Reset(RandomizedElectionTimeout())
 		return
 
 	} else {
@@ -348,14 +341,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		if rf.voted_for == -1 || args.CandidateId == rf.voted_for {
 			log_last_term_of_me := rf.log[len(rf.log)-1].Term
 			if args.LastLogTerm < log_last_term_of_me {
-				fmt.Println(rf.me, " not4 vote to ", args.CandidateId, ",", args)
 				reply.TermReply = rf.current_term
 				reply.VoteGranted = false
 				rf.mu.Unlock()
 				return
 			}
 			if args.LastLogTerm == log_last_term_of_me && args.LastLogIndex < rf.log[len(rf.log)-1].Index {
-				fmt.Println(rf.me, " not5 vote to ", args.CandidateId, ",", args)
 				reply.TermReply = rf.current_term
 				reply.VoteGranted = false
 				rf.mu.Unlock()
@@ -365,13 +356,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			// vote for it
 			reply.VoteGranted = true
 			reply.TermReply = rf.current_term
-			rf.voted_for = args.CandidateId
-			// fmt.Println(rf.me, " vote2 for ", args.CandidateId)
+			rf.convertToFollower(rf.current_term, args.CandidateId)
 			rf.mu.Unlock()
 			rf.electionTimer.Reset(RandomizedElectionTimeout())
 			return
 		} else {
-			fmt.Println(rf.me, " not6 vote to ", args.CandidateId, ",", args)
 			// already voted
 			reply.TermReply = rf.current_term
 			reply.VoteGranted = false
@@ -505,9 +494,8 @@ func (rf *Raft) StartElection() {
 						count++
 					} else if reply.TermReply > rf.current_term {
 						rf.mu.Lock()
-						rf.current_term = reply.TermReply
-						rf.role = Follower
-						rf.voted_for = -1
+						rf.convertToFollower(reply.TermReply, -1)
+						rf.electionTimer.Reset(RandomizedElectionTimeout())
 						rf.mu.Unlock()
 					}
 				}
@@ -529,13 +517,27 @@ func (rf *Raft) StartElection() {
 		cond.Wait()
 	}
 	if time_out {
-		fmt.Println(rf.me, " election timeout, re-elaction")
-		time.Sleep(time.Duration(sleep_time) * time.Millisecond)
+		rf.mu.Lock()
+		if rf.role != Candidate {
+			// could be follower
+			rf.electionTimer.Reset(RandomizedElectionTimeout())
+			rf.mu.Unlock()
+			return
+		}
+		rf.mu.Unlock()
+		fmt.Println(rf.me, " election timeout, re-elaction, role ", rf.role)
+		mu.Unlock()
+		time.Sleep(time.Duration(300) * time.Millisecond)
 		return
 	}
 	if count >= half {
 		fmt.Println(rf.me, " received ", count, " vote, more than half")
 		rf.mu.Lock()
+		if rf.role != Candidate {
+			rf.mu.Unlock()
+			fmt.Println(rf.me, " received more than half, but not Candidate")
+			return
+		}
 		rf.role = Leader
 		// init nextIndex and matchIndex
 		rf.next_index = make([]int, len(rf.peers))
@@ -550,27 +552,6 @@ func (rf *Raft) StartElection() {
 		time.Sleep(time.Duration(sleep_time) * time.Millisecond)
 	}
 	mu.Unlock()
-}
-
-func (rf *Raft) RequestVoteTo(x int, count int, finished int, mu *sync.Mutex, cond *sync.Cond) {
-	// send request vote rpc
-	var args RequestVoteArgs
-	var reply RequestVoteReply
-	rf.mu.Lock()
-	args.CandidateId = rf.me
-	args.CandidateTerm = rf.current_term
-	rf.mu.Unlock()
-	// args.LastLogIndex
-	// args.LastLogTerm
-	ok := rf.sendRequestVote(x, &args, &reply)
-	// fmt.Println(rf.me, "send request vote to ", x)
-	mu.Lock()
-	defer mu.Unlock()
-	if ok && reply.VoteGranted {
-		count++
-	}
-	finished++
-	cond.Broadcast()
 }
 
 func (rf *Raft) StartApplyLogs() {
@@ -622,6 +603,10 @@ func (rf *Raft) StartAppendEntriesOrHeastBeats() {
 			var reply AppendEntriesReply
 			args.LeaderId = rf.me
 			rf.mu.Lock()
+			if rf.role != Leader {
+				rf.mu.Unlock()
+				return
+			}
 			args.LeaderTerm = rf.current_term
 			args.LeaderCommitIndex = rf.commit_index
 			if rf.next_index[x]-1 < 0 {
@@ -648,7 +633,6 @@ func (rf *Raft) StartAppendEntriesOrHeastBeats() {
 					panic("error")
 				}
 				send_log_entries = true
-				// fmt.Println("send logs to ", x, " , logs ", args.LogEntries)
 			}
 
 			rf.mu.Unlock()
@@ -658,9 +642,8 @@ func (rf *Raft) StartAppendEntriesOrHeastBeats() {
 				rf.mu.Lock()
 				if reply.Term > rf.current_term {
 					// here reply false
-					rf.role = Follower
-					rf.current_term = reply.Term
-					rf.voted_for = -1
+					rf.convertToFollower(reply.Term, -1)
+					rf.electionTimer.Reset(RandomizedElectionTimeout())
 					rf.mu.Unlock()
 					fmt.Println(rf.me, " become follower...")
 					return
@@ -688,12 +671,26 @@ func (rf *Raft) StartAppendEntriesOrHeastBeats() {
 				rf.mu.Unlock()
 			} else {
 				// try more times
-				// fmt.Println("send heartbeat not ok")
+				// fmt.Println(rf.me, " send heartbeat to ", x, " not ok")
 			}
 		}(i)
 	}
 
 	go rf.StartApplyLogs()
+}
+
+func (rf *Raft) convertToFollower(new_term int, vote_for int) {
+	// need hold lock
+	rf.current_term = new_term
+	rf.role = Follower
+	rf.voted_for = vote_for
+}
+
+func (rf *Raft) convertToCandidate() {
+
+}
+
+func (rf *Raft) convertToLeader() {
 }
 
 // The ticker go routine starts a new election if this peer hasn't received
