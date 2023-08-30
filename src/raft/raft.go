@@ -186,7 +186,6 @@ type AppendEntriesReply struct {
 
 // AppendEntries RPC
 func (rf *Raft) AppendEntries(arg *AppendEntriesArgs, reply *AppendEntriesReply) {
-	// fmt.Println("append entries from ", arg.LeaderId)
 	rf.electionTimer.Reset(RandomizedElectionTimeout())
 
 	rf.mu.Lock()
@@ -231,9 +230,8 @@ func (rf *Raft) AppendEntries(arg *AppendEntriesArgs, reply *AppendEntriesReply)
 			rf.last_applied++
 			msg := ApplyMsg{CommandValid: true, CommandIndex: rf.log[rf.last_applied].Index, Command: rf.log[rf.last_applied].Command}
 			rf.applyCh <- msg
-			fmt.Println(rf.me, " apply ", msg)
+			DPrintf("%d apply %v", rf.me, msg)
 		}
-		fmt.Println(rf.me, " commit index ", rf.commit_index)
 	} else {
 		if arg.PrevLogIndex >= len(rf.log) {
 			reply.Term = rf.current_term
@@ -261,9 +259,8 @@ func (rf *Raft) AppendEntries(arg *AppendEntriesArgs, reply *AppendEntriesReply)
 			rf.last_applied++
 			msg := ApplyMsg{CommandValid: true, CommandIndex: rf.log[rf.last_applied].Index, Command: rf.log[rf.last_applied].Command}
 			rf.applyCh <- msg
-			fmt.Println(rf.me, " apply ", msg)
+			DPrintf("%d apply %v", rf.me, msg)
 		}
-		// fmt.Println(rf.me, " commit index ", rf.commit_index)
 	}
 
 	rf.convertToFollower(arg.LeaderTerm, -1)
@@ -429,7 +426,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	e := Entry{term, command, len(rf.log)}
 	rf.log = append(rf.log, e)
 	index = len(rf.log) - 1 // plus one for empty head
-	fmt.Println("Start command", command, ", index ", index, ", term ", term, ", log ", rf.log, ", me ", rf.me)
+	DPrintf("%d Start command %v, index %d, term %d, log %v", rf.me, command, index, term, rf.log)
 
 	rf.mu.Unlock()
 
@@ -501,7 +498,7 @@ func (rf *Raft) StartElection() {
 				}
 				finished++
 				cond.Broadcast()
-				fmt.Println(rf.me, "send request vote to ", x, " , reply ", reply.VoteGranted)
+				DPrintf("%d send request vote to %d, reply %t", rf.me, x, reply.VoteGranted)
 			}(i)
 		}
 	}
@@ -518,24 +515,19 @@ func (rf *Raft) StartElection() {
 	}
 	if time_out {
 		rf.mu.Lock()
-		if rf.role != Candidate {
-			// could be follower
-			rf.electionTimer.Reset(RandomizedElectionTimeout())
-			rf.mu.Unlock()
-			return
-		}
+		rf.convertToFollower(rf.current_term, -1)
+		rf.electionTimer.Reset(RandomizedElectionTimeout())
 		rf.mu.Unlock()
-		fmt.Println(rf.me, " election timeout, re-elaction, role ", rf.role)
+		DPrintf("%d election timeout, re-elaction, role %v", rf.me, rf.role)
 		mu.Unlock()
-		time.Sleep(time.Duration(300) * time.Millisecond)
 		return
 	}
 	if count >= half {
-		fmt.Println(rf.me, " received ", count, " vote, more than half")
+		DPrintf("%d received %d vote, more than half", rf.me, count)
 		rf.mu.Lock()
 		if rf.role != Candidate {
 			rf.mu.Unlock()
-			fmt.Println(rf.me, " received more than half, but not Candidate")
+			DPrintf("%d received more than half, but not Candidate", rf.me)
 			return
 		}
 		rf.role = Leader
@@ -548,7 +540,7 @@ func (rf *Raft) StartElection() {
 		}
 		rf.mu.Unlock()
 	} else {
-		fmt.Println(rf.me, " reveived ", count, " vote, less than half")
+		DPrintf("%d received %d vote, less than half", rf.me, count)
 		time.Sleep(time.Duration(sleep_time) * time.Millisecond)
 	}
 	mu.Unlock()
@@ -568,7 +560,7 @@ func (rf *Raft) StartApplyLogs() {
 	half := len(rf.peers) / 2
 	update_index := v[half]
 	if update_index > rf.commit_index && rf.log[update_index].Term == rf.current_term {
-		fmt.Println("update_index", update_index)
+		DPrintf("update_index %d", update_index)
 		rf.commit_index = update_index
 	}
 	rf.mu.Unlock()
@@ -579,10 +571,10 @@ func (rf *Raft) StartApplyLogs() {
 		msg.CommandIndex = rf.log[rf.last_applied].Index
 		msg.Command = rf.log[rf.last_applied].Command
 		rf.applyCh <- msg
-		fmt.Println("apply command", msg.Command, " index ", msg.CommandIndex)
+		DPrintf("%d apply command %v index %d", rf.me, msg.Command, msg.CommandIndex)
 	}
 
-	fmt.Println(rf.me, " commit index ", rf.commit_index, ", last applied ", rf.last_applied)
+	DPrintf("%d commit index %d, last applied %d", rf.me, rf.commit_index, rf.last_applied)
 }
 
 func (rf *Raft) StartAppendEntriesOrHeastBeats() {
@@ -638,14 +630,14 @@ func (rf *Raft) StartAppendEntriesOrHeastBeats() {
 			rf.mu.Unlock()
 			ok := rf.sendAppendEntries(x, &args, &reply)
 			if ok {
-				fmt.Println(rf.me, " send heartbeat to ", x, ", reply success: ", reply.Success, ", its term: ", reply.Term)
+				DPrintf("%d send heartbeat to %d, reply success: %t, its term: %d", rf.me, x, reply.Success, reply.Term)
 				rf.mu.Lock()
 				if reply.Term > rf.current_term {
 					// here reply false
 					rf.convertToFollower(reply.Term, -1)
 					rf.electionTimer.Reset(RandomizedElectionTimeout())
 					rf.mu.Unlock()
-					fmt.Println(rf.me, " become follower...")
+					DPrintf("%d become follower...", rf.me)
 					return
 				}
 				// update next_index
@@ -653,7 +645,7 @@ func (rf *Raft) StartAppendEntriesOrHeastBeats() {
 					if send_log_entries {
 						rf.match_index[x] = len_log - 1
 						rf.next_index[x] = rf.match_index[x] + 1
-						fmt.Println(x, ": match_index ", rf.match_index[x], ", next_index ", rf.next_index[x])
+						DPrintf("%d: match_index %d, next_index %d", rf.me, rf.match_index[x], rf.next_index[x])
 					}
 
 				} else {
@@ -663,7 +655,7 @@ func (rf *Raft) StartAppendEntriesOrHeastBeats() {
 						if rf.next_index[x] < 1 {
 							rf.next_index[x] = 1
 						}
-						fmt.Println(x, " next index decri ", rf.next_index[x])
+						DPrintf("%d next index decri %d", x, rf.next_index[x])
 
 					}
 					// heartbeat reply false
@@ -671,7 +663,6 @@ func (rf *Raft) StartAppendEntriesOrHeastBeats() {
 				rf.mu.Unlock()
 			} else {
 				// try more times
-				// fmt.Println(rf.me, " send heartbeat to ", x, " not ok")
 			}
 		}(i)
 	}
@@ -708,7 +699,7 @@ func (rf *Raft) ticker() {
 
 			select {
 			case <-rf.electionTimer.C:
-				fmt.Println(rf.me, " have not heard from leader")
+				DPrintf("%d have not heard from leader", rf.me)
 				rf.mu.Lock()
 				rf.role = Candidate
 				rf.mu.Unlock()
