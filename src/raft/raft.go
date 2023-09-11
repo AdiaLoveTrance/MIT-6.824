@@ -198,6 +198,8 @@ func (rf *Raft) AppendEntries(arg *AppendEntriesArgs, reply *AppendEntriesReply)
 	}
 
 	// arg.LeaderTerm >= rf.current_term goes here
+	rf.convertToFollower(arg.LeaderTerm, arg.LeaderId)
+
 	if len(arg.LogEntries) > 0 {
 		// log没有那一项
 		if arg.PrevLogIndex >= len(rf.log) {
@@ -262,8 +264,6 @@ func (rf *Raft) AppendEntries(arg *AppendEntriesArgs, reply *AppendEntriesReply)
 			DPrintf("%d apply %v", rf.me, msg)
 		}
 	}
-
-	rf.convertToFollower(arg.LeaderTerm, -1)
 
 	reply.Success = true
 	reply.Term = rf.current_term
